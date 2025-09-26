@@ -1,0 +1,133 @@
+from datetime import datetime, timedelta
+import pandas as pd, geopandas as gpd
+from sliderule import sliderule
+import matplotlib.pyplot as plt
+from shapely.geometry import Polygon
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+sliderule.init("slideruleearth.io", verbose=True, rethrow=True)
+
+poly = [
+    {"lon": -68.30, "lat": 77.33},
+    {"lon": -68.30, "lat": 77.35},
+    {"lon": -68.10, "lat": 77.35},
+    {"lon": -68.10, "lat": 77.33},
+    {"lon": -68.30, "lat": 77.33},
+]
+base = {"asset": "icesat2", "poly": poly, "srt": 0} #"cnf": [2,3,4]}
+
+start = datetime.fromisoformat("2020-07-01")
+end   = datetime.fromisoformat("2020-07-31") + timedelta(hours=23, minutes=59, seconds=59)
+
+def chunks(t0, t1, days=3):
+    cur = t0
+    while cur <= t1:
+        nxt = min(cur + timedelta(days=days) - timedelta(seconds=1), t1)
+        yield cur.strftime("%Y-%m-%dT%H:%M:%SZ"), nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cur = nxt + timedelta(seconds=1)
+
+frames = []
+for t0, t1 in chunks(start, end, 3):
+    try:
+        part = sliderule.run("atl03x", {**base, "t0": t0, "t1": t1})
+        if not part.empty:
+            frames.append(part)
+            print(f"{t0} → {t1}: {len(part)}")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"{t0} → {t1} FAILED: {e}")
+
+ATL03_land = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True)) if frames else gpd.GeoDataFrame()
+print("TOTAL photons:", len(ATL03_land))
+
+# --- Plot ATL03 photons: x_atc vs height, with LMH (>=2) overlaid ---
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+if ATL03_land.empty:
+    raise ValueError("ATL03_land is empty – nothing to plot.")
+
+# Figure out column names from the X-series dataframe
+# (height is 'height' in X-series; some builds also include 'h_ph')
+h_col = "height" if "height" in ATL03_land.columns else "h_ph"
+x_col = "x_atc"   # along-track distance (meters)
+
+# Confidence: prefer 'atl03_cnf' (X-series) else fall back to 'signal_conf_ph'
+# if "atl03_cnf" in ATL03_land.columns:
+#     conf = ATL03_land["atl03_cnf"].values
+# elif "signal_conf_ph" in ATL03_land.columns:
+#     conf = ATL03_land["signal_conf_ph"].values
+# else:
+#     raise KeyError("No confidence column found ('atl03_cnf' or 'signal_conf_ph').")
+
+# confidence column (prefer X-series atl03_cnf)
+if "atl03_cnf" in ATL03_land.columns:
+    conf = ATL03_land["atl03_cnf"].to_numpy()
+elif "signal_conf_ph" in ATL03_land.columns:
+    conf = ATL03_land["signal_conf_ph"].to_numpy()
+else:
+    raise KeyError("No confidence column ('atl03_cnf' or 'signal_conf_ph') found.")
+
+# Low/Med/High mask (>= 2)
+lmh_mask = np.asarray(conf) >= 2
+
+# (Optional) quality filter: keep only good photons (0 = good)
+if "quality_ph" in ATL03_land.columns:
+    # good_q = ATL03_land["quality_ph"].values == 0
+    # lmh_mask = lmh_mask & good_q
+    lmh_mask &= (ATL03_land["quality_ph"].to_numpy() == 0)
+
+
+# Downsample for speed if you have millions of photons
+MAX_POINTS = 500_000
+idx_all = np.arange(len(ATL03_land))
+if len(idx_all) > MAX_POINTS:
+    idx_all = np.random.choice(idx_all, size=MAX_POINTS, replace=False)
+#for all the photons, not just LMH
+# extract arrays
+x_all = ATL03_land[x_col].to_numpy()
+h_all = ATL03_land[h_col].to_numpy()
+x_lmh = ATL03_land.loc[lmh_mask, x_col].to_numpy()
+h_lmh = ATL03_land.loc[lmh_mask, h_col].to_numpy()
+
+# (optional) downsample the black background for speed
+MAX_ALL = 600_000
+if x_all.size > MAX_ALL:
+    sel = np.random.choice(x_all.size, MAX_ALL, replace=False)
+    x_all = x_all[sel]; h_all = h_all[sel]
+
+# plot: black first (behind), green overlay (front)
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(x_all, h_all, ".", ms=0.20, alpha=0.25, color="k", label="all photons", zorder=1)
+ax.plot(x_lmh, h_lmh, ".", ms=0.60, alpha=0.90, color="g",
+        label="flagged photons (LMH≥2)", zorder=2)
+
+ax.set_xlabel("x_atc, m")
+ax.set_ylabel("h, m")
+ax.legend(loc="best")
+ax.set_title("ICESat-2 ATL03 — all photons vs. surface-flagged (LMH≥2)")
+plt.tight_layout(); plt.show()
+
+#ONLY LMH PHTONS
+# Data arrays
+# x_all = ATL03_land.iloc[idx_all][x_col].values
+# h_all = ATL03_land.iloc[idx_all][h_col].values
+
+# x_lmh = ATL03_land.loc[lmh_mask, x_col].values
+# h_lmh = ATL03_land.loc[lmh_mask, h_col].values
+
+# # Plot
+# fig, ax = plt.subplots(figsize=(7, 4.5))
+# ax.plot(x_all, h_all, ".", markersize=0.25, alpha=0.35, label="all photons", color="k")
+# ax.plot(x_lmh, h_lmh, ".", markersize=0.5, alpha=0.8, label="flagged photons (LMH≥2)", color="g")
+
+# ax.set_xlabel("x_atc, m")
+# ax.set_ylabel("h, m")
+# ax.legend(loc="best")
+# ax.set_title("ICESat-2 ATL03 photons (LAND) — all vs. surface-flagged")
+# plt.tight_layout()
+# plt.show()
+
+
