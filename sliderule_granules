@@ -1,0 +1,349 @@
+# thule_orbits_one_cycle_3months.py
+# THU_L / THU_U + square AOI in UTM20N; ICESat-2 ATL03 beams for 3 months.
+# For each month we pick ONE cycle_number (you choose or auto) and then ONE RGT
+# that crosses the AOI, so the 6 beams (gt1l..gt3r) appear as parallel lines.
+#
+# Requires: sliderule, geopandas, shapely, rasterio, matplotlib, pandas, numpy
+# SlideRule docs: https://slideruleearth.io  (service: "atl03x")
+
+from datetime import datetime, timedelta
+import numpy as np, pandas as pd, geopandas as gpd
+import matplotlib.pyplot as plt
+from shapely.geometry import Polygon, LineString, box
+from sliderule import sliderule
+import rasterio
+from rasterio.plot import show as rio_show
+
+# ---------------------- USER SETTINGS ----------------------
+UTM_CRS     = "EPSG:32620"        # UTM 20N WGS84 (meters)
+# Square AOI center and side (meters)
+CENTER_E    = 362000
+CENTER_N    = 8485500
+SIDE_M      = 6000
+
+# 3-month window (start at first day of first month)
+START_MONTH = "2020-09-01"
+N_MONTHS    = 3
+
+# Keep ONE cycle per month (set to an integer to force; None = auto select most common)
+FORCE_CYCLE = None    # e.g., 11 or 12, else None to auto
+# Optional: only consider these beams; None = all six
+BEAMS       = None    # e.g., ["gt2l","gt2r"]
+# SlideRule sub-query size (smaller chunks are more robust)
+CHUNK_DAYS  = 3
+# SlideRule surface type (0=land, 3=land-ice; both work here)
+SRT         = 3
+# Optional backdrop GeoTIFF already in UTM20N
+BASEMAP_TIF = None    # e.g., "Thule_S2_Sept2020_bestday_UTM20N_RGB.tif"
+
+# PROMICE stations
+STATIONS = [
+    {"name": "THU_L", "lat": 76.3998511, "lon": -68.2677449},
+    {"name": "THU_U", "lat": 76.3900982, "lon": -68.1109372},
+]
+# -----------------------------------------------------------
+
+# ------------------- geometry helpers ---------------------
+from shapely.geometry import box, Polygon
+
+def square_utm(center_e, center_n, side_m, crs=UTM_CRS):
+    h = side_m/2.0
+    poly = Polygon([(center_e-h, center_n-h),
+                    (center_e-h, center_n+h),
+                    (center_e+h, center_n+h),
+                    (center_e+h, center_n-h),
+                    (center_e-h, center_n-h)])
+    return gpd.GeoDataFrame({"name":["AOI"]}, geometry=[poly], crs=crs)
+
+def stations_gdf_utm(crs):
+    st = pd.DataFrame(STATIONS)
+    return gpd.GeoDataFrame(st, geometry=gpd.points_from_xy(st.lon, st.lat), crs=4326).to_crs(crs)
+
+def ensure_stations_in_aoi(aoi_utm, margin_m=800):
+    """If THU stations sit at/near the border, expand AOI a bit so both are comfortably inside."""
+    gst = stations_gdf_utm(aoi_utm.crs)
+    poly = aoi_utm.geometry.iloc[0]
+    if gst.within(poly).all():
+        return aoi_utm, gst
+    xmin, ymin, xmax, ymax = map(float, poly.bounds)
+    sxmin, symin, sxmax, symax = map(float, gst.total_bounds)
+    xmin = min(xmin, sxmin - margin_m)
+    ymin = min(ymin, symin - margin_m)
+    xmax = max(xmax, sxmax + margin_m)
+    ymax = max(ymax, symax + margin_m)
+    expanded = gpd.GeoDataFrame({"name":["AOI"]}, geometry=[box(xmin, ymin, xmax, ymax)], crs=aoi_utm.crs)
+    return expanded, gst
+
+# -------------------- time utilities ----------------------
+def add_months(dt, k):
+    y = dt.year + (dt.month - 1 + k)//12
+    m = (dt.month - 1 + k) % 12 + 1
+    return datetime(y, m, 1)
+
+def month_periods(start_month, n):
+    start = datetime.fromisoformat(start_month)
+    for i in range(n):
+        t0 = add_months(start, i)
+        t1 = add_months(start, i+1) - timedelta(seconds=1)
+        label = t0.strftime("%Y-%m")
+        yield t0, t1, label
+
+def time_chunks(t0, t1, days=3):
+    cur = t0
+    while cur <= t1:
+        end = min(cur + timedelta(days=days) - timedelta(seconds=1), t1)
+        yield cur.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cur = end + timedelta(seconds=1)
+
+# --------------- SlideRule/ATL03 helpers ------------------
+def _ensure_ccw_lonlat(poly_ll):
+    """CMR expects polygon rings counter-clockwise; ensure it."""
+    ring = list(poly_ll.exterior.coords)
+    area2 = sum(x1*y2 - x2*y1 for (x1,y1),(x2,y2) in zip(ring, ring[1:]))
+    if area2 < 0:   # CW -> reverse
+        ring = ring[::-1]
+    if ring[0] == ring[-1]:
+        ring = ring[:-1]
+    ring.append(ring[0])
+    return [{"lon": float(x), "lat": float(y)} for (x,y) in ring]
+
+def fetch_month(aoi_utm, yyyy_mm, srt=SRT, beams=BEAMS, chunk_days=CHUNK_DAYS):
+    """ATL03 photons (lon/lat CRS) for one month; returns GeoDataFrame (may be empty)."""
+    sliderule.init("slideruleearth.io", verbose=False, rethrow=True)
+    poly_ll = _ensure_ccw_lonlat(aoi_utm.to_crs(4326).geometry.iloc[0])
+    base = {"asset":"icesat2", "poly": poly_ll, "srt": srt}
+    if beams: base["beams"] = beams
+
+    # month bounds
+    t0 = datetime.fromisoformat(f"{yyyy_mm}-01")
+    ny = t0.year + (t0.month // 12)
+    nm = 1 if t0.month == 12 else t0.month + 1
+    t1 = datetime(ny, nm, 1) - timedelta(seconds=1)
+
+    frames = []
+    for s0, s1 in time_chunks(t0, t1, days=chunk_days):
+        for attempt in (1, 2):  # retry transient "staging" misses
+            try:
+                df = sliderule.run("atl03x", {**base, "t0": s0, "t1": s1})
+                if not df.empty:
+                    frames.append(df)
+                    print(f"{yyyy_mm}  {s0} → {s1}: {len(df)} photons")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"{yyyy_mm}  {s0} → {s1}: FAILED after retry: {e}")
+                else:
+                    print(f"{yyyy_mm}  {s0} → {s1}: FAILED (retrying): {e}")
+
+    if not frames:
+        return gpd.GeoDataFrame({"geometry": gpd.GeoSeries([], crs=4326)}, geometry="geometry", crs=4326)
+
+    g = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True))
+    if g.crs is None:
+        g = g.set_crs(4326)
+    return g
+
+def normalize_beam_column(g):
+    """Return column name with canonical beam labels gt1l..gt3r, creating it if needed."""
+    bcol = next((c for c in ("beam","gt","gtx","spot") if c in g.columns), None)
+    if bcol is None:
+        raise KeyError("No beam column (beam/gt/gtx/spot) found in ATL03 table")
+
+    def to_beam_name(v):
+        try: v = int(v)
+        except Exception: pass
+        mapping = {
+            10:"gt1l", 20:"gt1r", 30:"gt2l", 40:"gt2r", 50:"gt3l", 60:"gt3r",
+             1:"gt1l",  2:"gt1r",  3:"gt2l",  4:"gt2r",  5:"gt3l",  6:"gt3r",
+        }
+        s = mapping.get(v, str(v))
+        return s.lower()
+    if g[bcol].dtype != "O":
+        g["beam_name"] = g[bcol].map(to_beam_name)
+    else:
+        g["beam_name"] = g[bcol].str.lower()
+    return "beam_name"
+
+def pick_one_cycle_and_rgt(g_ll, aoi_utm, force_cycle=None):
+    """
+    Keep ONE cycle_number and ONE rgt that intersect the AOI (max photons inside box).
+    Returns filtered GeoDataFrame (lon/lat), chosen (cycle, rgt) tuple, and AOI polygon in lon/lat.
+    """
+    if g_ll.empty:
+        return g_ll, (None, None), aoi_utm.to_crs(4326).geometry.iloc[0]
+
+    cyc_col = next((c for c in ("cycle_number","cycle") if c in g_ll.columns), None)
+    rgt_col = next((c for c in ("rgt","track") if c in g_ll.columns), None)
+    if cyc_col is None or rgt_col is None:
+        raise KeyError("ATL03 must include 'cycle_number' (or 'cycle') and 'rgt' (or 'track').")
+
+    poly_ll = aoi_utm.to_crs(4326).geometry.iloc[0]
+    g_ll = g_ll[gpd.GeoSeries(g_ll.geometry, crs=g_ll.crs).within(poly_ll)]
+
+    if g_ll.empty:
+        return g_ll, (None, None), poly_ll
+
+    # choose cycle
+    if force_cycle is None:
+        chosen_cycle = int(g_ll[cyc_col].mode().iloc[0])  # most frequent cycle present
+    else:
+        chosen_cycle = int(force_cycle)
+    gc = g_ll[g_ll[cyc_col] == chosen_cycle]
+    if gc.empty:
+        # fall back to any available
+        chosen_cycle = int(g_ll[cyc_col].mode().iloc[0])
+        gc = g_ll[g_ll[cyc_col] == chosen_cycle]
+
+    # choose the RGT with most photons inside AOI
+    counts = gc.groupby(rgt_col).size().sort_values(ascending=False)
+    chosen_rgt = int(counts.index[0])
+    gcr = gc[gc[rgt_col] == chosen_rgt].copy()
+
+    print(f"Chosen cycle={chosen_cycle}, rgt={chosen_rgt} (photons inside AOI: {len(gcr)})")
+    return gcr, (chosen_cycle, chosen_rgt), poly_ll
+
+def build_beam_segments(g_ll, aoi_utm):
+    """
+    Make a polyline segment per BEAM (gt1l..gt3r) clipped to AOI (in UTM CRS).
+    Assumes input photons already filtered to one cycle and one RGT.
+    """
+    if g_ll.empty:
+        return gpd.GeoDataFrame({"beam":[],"geometry":[]}, geometry="geometry", crs=aoi_utm.crs)
+
+    bname = normalize_beam_column(g_ll)
+    g = g_ll.to_crs(aoi_utm.crs)
+    poly = aoi_utm.geometry.iloc[0]
+
+    rows = []
+    for beam, dfb in g.groupby(bname):
+        # sort to make a clean line
+        if "time_ns" in dfb.columns: dfb = dfb.sort_values("time_ns")
+        elif "x_atc" in dfb.columns:  dfb = dfb.sort_values("x_atc")
+
+        step = max(1, len(dfb)//5000)
+        xy = np.column_stack([dfb.geometry.x.values[::step], dfb.geometry.y.values[::step]])
+        if xy.shape[0] < 2: continue
+
+        seg = LineString(xy).intersection(poly)
+        if seg.is_empty: continue
+        if seg.geom_type == "MultiLineString":
+            seg = max(list(seg.geoms), key=lambda L: L.length)
+        if seg.length < 30: continue
+
+        rows.append({"beam": beam, "geometry": seg})
+
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=aoi_utm.crs)
+
+# ------------------------- plotting ------------------------
+def scalebar_1km(ax):
+    x0,x1 = ax.get_xlim(); y0,y1 = ax.get_ylim()
+    L = 1000.0
+    x_left = x0 + 0.04*(x1-x0)
+    x_right = x_left + L
+    y = y0 + 0.035*(y1-y0)
+    ax.plot([x_left,x_right],[y,y], lw=3, color="k", solid_capstyle="butt", zorder=10)
+    ax.text((x_left+x_right)/2, y + 0.012*(y1-y0), "1 km", ha="center", va="bottom", fontsize=10)
+
+def plot_months(aoi_utm, stations_utm, month_segments, title_suffix):
+    # beam colors
+    beam_order = ["gt1l","gt1r","gt2l","gt2r","gt3l","gt3r"]
+    colors = {"gt1l":"tab:blue","gt1r":"tab:orange","gt2l":"tab:green",
+              "gt2r":"tab:red","gt3l":"tab:purple","gt3r":"tab:brown"}
+    # month styles
+    months = list(month_segments.keys())
+    styles = ["-","--",":"]
+    sty = {m: styles[i % len(styles)] for i,m in enumerate(months)}
+
+    fig, ax = plt.subplots(figsize=(10,10))
+    if BASEMAP_TIF:
+        try:
+            with rasterio.open(BASEMAP_TIF) as src: rio_show(src, ax=ax)
+            ax.images[-1].set_alpha(0.85)
+        except Exception as e:
+            print("(Basemap skipped:", e, ")")
+
+    aoi_utm.boundary.plot(ax=ax, color="k", linewidth=2, zorder=2, label="AOI")
+
+    # draw by month then beam (so parallel sets are visible)
+    for m in months:
+        segs = month_segments[m]
+        for b in beam_order:
+            s = segs[segs["beam"]==b]
+            if len(s):
+                s.plot(ax=ax, color=colors.get(b,"0.4"), linestyle=sty[m], linewidth=1.8, zorder=3)
+
+    # stations
+    stations_utm.plot(ax=ax, color="yellow", edgecolor="k", markersize=70, zorder=4, label="PROMICE")
+    for _, s in stations_utm.iterrows():
+        ax.text(s.geometry.x + 550, s.geometry.y, s["name"], fontsize=11, fontweight="bold",
+                ha="left", va="center", color="k", zorder=5)
+
+    xmin,ymin,xmax,ymax = aoi_utm.total_bounds
+    ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal", adjustable="box")
+    scalebar_1km(ax)
+    ax.set_title(f"ICESat-2 ATL03 beams (parallel — one cycle & one RGT per month)\n{title_suffix}")
+    ax.set_xlabel(f"Easting (m) — {aoi_utm.crs}"); ax.set_ylabel(f"Northing (m) — {aoi_utm.crs}")
+    ax.grid(True, linestyle="--", color="0.85")
+
+    # legends
+    import matplotlib.lines as mlines
+    beam_handles=[mlines.Line2D([0],[0], color=colors[b], lw=2, label=b)
+                  for b in beam_order if any((b in segs["beam"].unique()) for segs in month_segments.values())]
+    month_handles=[mlines.Line2D([0],[0], color="k", lw=2, linestyle=sty[m], label=m) for m in months]
+    extra=[mlines.Line2D([0],[0], color="k", lw=2, label="AOI"),
+           mlines.Line2D([0],[0], marker="o", color="k", lw=0, markerfacecolor="yellow", label="PROMICE")]
+    leg1=ax.legend(handles=beam_handles+extra, loc="upper right", frameon=True, title="Beams")
+    ax.add_artist(leg1)
+    ax.legend(handles=month_handles, loc="lower right", frameon=True, title="Months")
+
+    plt.tight_layout()
+    outpng = f"thule_orbits_parallel_{months[0]}_{months[-1]}.png"
+    plt.savefig(outpng, dpi=300)
+    plt.show()
+    print("Saved:", outpng)
+
+# --------------------------- main --------------------------
+def main():
+    # AOI and stations
+    aoi = square_utm(CENTER_E, CENTER_N, SIDE_M, UTM_CRS)
+    aoi, stations = ensure_stations_in_aoi(aoi, margin_m=800)
+
+    month_segments = {}         # month label -> GeoDataFrame of beam segments in UTM
+    chosen_pairs   = {}         # month label -> (cycle, rgt)
+
+    for t0, t1, label in month_periods(START_MONTH, N_MONTHS):
+        yyyy_mm = label
+        print("\n===", yyyy_mm, "===")
+        g_ll = fetch_month(aoi, yyyy_mm, srt=SRT, beams=BEAMS, chunk_days=CHUNK_DAYS)
+
+        # pick ONE cycle and ONE RGT that cross AOI (max photons)
+        g_filtered, (cyc, rgt), _ = pick_one_cycle_and_rgt(g_ll, aoi, force_cycle=FORCE_CYCLE)
+        if g_filtered.empty:
+            print(f"No photons inside AOI for {yyyy_mm} (skip).")
+            continue
+
+        # build per-beam segments for that (cycle, rgt) -> parallel beams
+        segs = build_beam_segments(g_filtered, aoi)
+        if segs.empty:
+            print(f"No beam segments built for {yyyy_mm} (skip).")
+            continue
+
+        month_segments[yyyy_mm] = segs
+        chosen_pairs[yyyy_mm]   = (cyc, rgt)
+        print(f"{yyyy_mm}: beams present ->", sorted(segs["beam"].unique()))
+
+    if not month_segments:
+        raise SystemExit("Nothing to plot — try a different month range or SRT.")
+
+    # brief console summary
+    print("\nChosen (cycle, rgt) per month:")
+    for m, (c, r) in chosen_pairs.items():
+        print(f"  {m}: cycle={c}, rgt={r}")
+
+    # plot
+    title = f"{list(month_segments.keys())[0]} to {list(month_segments.keys())[-1]}"
+    plot_months(aoi, stations, month_segments, title_suffix=title)
+
+if __name__ == "__main__":
+    main()
