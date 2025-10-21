@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# SlideRule ATL03 → photons in AOI → one FIGURE PER GRANULE, grouped by month
+# deps: sliderule, numpy, pandas, matplotlib
+
+from sliderule import icesat2
+import numpy as np, pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")  # remove if headless
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from datetime import datetime
+import calendar, os
+
+# ========= CONFIG =========
+# AOI polygon (lon, lat) — CCW, last=first
+AOI = [
+    (-68.50, 77.30),
+    (-67.50, 77.30),
+    (-67.50, 77.40),
+    (-68.50, 77.40),
+    (-68.50, 77.30),
+]
+
+# Months you want (YYYY-MM). Add/remove as needed.
+MONTHS = ["2020-09", "2020-11"]
+
+# Plot colors for LMH (change freely)
+COLORS = {2: "#FDBF6F", 3: "#1F78B4", 4: "#33A02C"}
+LABELS = {2: "Low",     3: "Medium",  4: "High"}
+
+SAVE_DIR = None  # e.g., "figs_aoi"; set to a folder to save images
+THIN_ALL = 2     # subsample for gray background cloud (>=1)
+
+# ========= INIT =========
+icesat2.init("slideruleearth.io")
+
+# ========= HELPERS =========
+def month_range(yyyymm: str):
+    y, m = map(int, yyyymm.split("-"))
+    last = calendar.monthrange(y, m)[1]
+    t0 = f"{y:04d}-{m:02d}-01T00:00:00Z"
+    t1 = f"{y:04d}-{m:02d}-{last:02d}T23:59:59Z"
+    return t0, t1
+
+def spot_to_beam(spot, sc_orient):
+    pair = {1:"gt1",2:"gt1",3:"gt2",4:"gt2",5:"gt3",6:"gt3"}[int(spot)]
+    if int(sc_orient) == 0:
+        side = "r" if spot in (1,3,5) else "l"
+    else:
+        side = "l" if spot in (1,3,5) else "r"
+    return f"{pair}{side}"
+
+def safe_name(s):  # for filenames
+    return "".join(c if c.isalnum() or c in "-._" else "_" for c in str(s))
+
+# ========= RUN PER MONTH =========
+if SAVE_DIR:
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+for mon in MONTHS:
+    t0, t1 = month_range(mon)
+
+    parms = {
+        "poly": [{"lon": lon, "lat": lat} for lon, lat in AOI],
+        "t0": t0,
+        "t1": t1,
+        "cnf": [2,3,4],              # LMH only
+        # Optional throttles:
+        # "maxresources": 20, "subsample": 1
+    }
+
+    gdf = icesat2.atl03sp(parms, resources=None)  # GeoDataFrame clipped to AOI
+    if gdf is None or len(gdf) == 0:
+        print(f"[{mon}] No photons in AOI.")
+        continue
+
+    # Ensure along-track exists
+    if "x_atc" not in gdf.columns:
+        sort_keys = [k for k in ["file_id","spot","segment_id","ph_index"] if k in gdf.columns]
+        if sort_keys: gdf = gdf.sort_values(sort_keys)
+        grp_keys = [k for k in ["file_id","spot"] if k in gdf.columns]
+        if grp_keys:
+            gdf["x_atc"] = gdf.groupby(grp_keys).cumcount().astype(float)
+        else:
+            gdf["x_atc"] = np.arange(len(gdf), dtype=float)
+
+    # Beam label
+    if "spot" in gdf.columns and "sc_orient" in gdf.columns:
+        gdf["beam"] = [spot_to_beam(s, o) for s, o in zip(gdf["spot"], gdf["sc_orient"])]
+    else:
+        gdf["beam"] = [f"SPOT {s}" for s in gdf["spot"]] if "spot" in gdf.columns else "ALL"
+
+    # Choose granule id column
+    granule_cols = [c for c in ["file_id","resource","granule","granule_id"] if c in gdf.columns]
+    granule_col = granule_cols[0] if granule_cols else "file_id"
+    if granule_col not in gdf.columns:
+        gdf["file_id"] = gdf.get("rgt", 0).astype(str) + "_rgt"
+        granule_col = "file_id"
+
+    # Plot: one figure per granule, photons already restricted to AOI
+    for gid, sub_g in gdf.groupby(granule_col):
+        if sub_g.empty: 
+            continue
+
+        beams = ["gt1l","gt1r","gt2l","gt2r","gt3l","gt3r"]
+        available = sorted(sub_g["beam"].unique())
+        if not set(available).issuperset(beams):
+            beams = available[:6]
+
+        fig, axes = plt.subplots(3, 2, figsize=(14,10), sharex=False, sharey=False)
+        axes = axes.ravel()
+
+        for i in range(6):
+            if i >= len(beams):
+                fig.delaxes(axes[i]); continue
+            b = beams[i]
+            ax = axes[i]
+            sub_b = sub_g[sub_g["beam"] == b]
+            if sub_b.empty:
+                ax.set_title(b.upper()); ax.grid(alpha=0.25); continue
+
+            # Base (gray)
+            ax.scatter(sub_b["x_atc"][::THIN_ALL], sub_b["height"][::THIN_ALL],
+                       s=0.2, color="0.25", alpha=0.25, label="All photons")
+
+            # LMH colors
+            if "cnf" in sub_b.columns:
+                for val in (2,3,4):
+                    sv = sub_b[sub_b["cnf"] == val]
+                    if not sv.empty:
+                        ax.scatter(sv["x_atc"], sv["height"],
+                                   s=0.6, color=COLORS[val], label=LABELS[val])
+
+            ax.set_title(str(b).upper())
+            ax.set_xlabel("Along-track (m)")
+            ax.set_ylabel("Height (m)")
+            ax.grid(alpha=0.25)
+
+        # Shared legend
+        if "cnf" in sub_g.columns:
+            handles = [Line2D([0],[0], marker='o', color='w',
+                              markerfacecolor=COLORS[k], markersize=6, linestyle='None')
+                       for k in (2,3,4)]
+            fig.legend(handles, [LABELS[k] for k in (2,3,4)], loc="upper center", ncol=3)
+
+        fig.suptitle(f"ICESat-2 ATL03 photons in AOI — {mon} — {granule_col}: {gid}")
+        fig.tight_layout(rect=(0,0,1,0.95))
+
+        if SAVE_DIR:
+            out = os.path.join(SAVE_DIR, f"atl03_aoi_{safe_name(mon)}_{safe_name(gid)}.png")
+            fig.savefig(out, dpi=200)
+
+        plt.show()
+
+
+
