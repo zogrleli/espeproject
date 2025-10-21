@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+# Minimal ATL03 -> clean -> variogram -> krige -> high-pass -> H
+# deps: earthaccess h5py numpy matplotlib
+
+import os, numpy as np, h5py, matplotlib.pyplot as plt
+from typing import TypedDict, cast
+import earthaccess as ea
+
+# -------------------- Config --------------------
+AOI   = (-68.5, 77.30, -67.5, 77.40)          # minlon, minlat, maxlon, maxlat
+TIME  = ("2019-09-01T00:00:00Z", "2019-09-30T23:59:59Z")
+OUT   = "./atl03_granules"; os.makedirs(OUT, exist_ok=True)
+BEAMS = ["gt1l","gt1r","gt2l","gt2r","gt3l","gt3r"]
+SURFACE_COL = 3                                # land-ice column in signal_conf_ph
+RANGE = 15.0                                   # Gaussian range for variogram/OK
+HP_LAMBDA = 35                                 # high-pass cutoff (m)
+H_WINDOW  = 200                                # window for H (m)
+
+# -------------------- I/O helpers --------------------
+class BeamData(TypedDict):
+    h: np.ndarray; dist_ph_along: np.ndarray; conf: np.ndarray
+    seg_x: np.ndarray; ph_index_beg: np.ndarray; seg_cnt: np.ndarray
+    lon: np.ndarray; lat: np.ndarray
+
+def _arr(g: h5py.Group, name: str) -> np.ndarray:  # h5py.Dataset -> ndarray
+    return np.asarray(cast(h5py.Dataset, g[name])[()])
+
+def read_beam(f: h5py.File, beam: str) -> BeamData:
+    hg, gg = cast(h5py.Group, f[f"{beam}/heights"]), cast(h5py.Group, f[f"{beam}/geolocation"])
+    conf = _arr(hg, "signal_conf_ph")
+    if conf.ndim == 2 and conf.shape[0] == 5: conf = conf.T  # 5xN -> Nx5
+    return {
+        "h": _arr(hg,"h_ph"),
+        "dist_ph_along": _arr(hg,"dist_ph_along"),
+        "conf": conf.astype(np.int16, copy=False),
+        "seg_x": _arr(gg,"segment_dist_x"),
+        "ph_index_beg": _arr(gg,"ph_index_beg").astype(int, copy=False),
+        "seg_cnt": _arr(gg,"segment_ph_cnt").astype(int, copy=False),
+        "lon": _arr(hg,"lon_ph"), "lat": _arr(hg,"lat_ph")
+    }
+
+def along_track(seg_x, ph_index_beg, seg_cnt, dist_ph_along, nphot):
+    x = np.full(int(nphot), np.nan); starts = ph_index_beg - 1
+    for j in range(seg_x.size):
+        cnt = int(seg_cnt[j]); 
+        if cnt <= 0: continue
+        i0, i1 = int(starts[j]), int(starts[j])+cnt
+        x[i0:i1] = float(seg_x[j]) + dist_ph_along[i0:i1]
+    return x
+import numpy as np
+import h5py
+import matplotlib.pyplot as plt
+
+BEAMS = ["gt1l","gt1r","gt2l","gt2r","gt3l","gt3r"]
+
+def plot_one_beam(files, beam, bbox, surface_row=3, thin_step=2,
+                  show_all_black=True, title_prefix="ATL03", save=None):
+    """
+    Make one plot for a single beam, stacking all matching granules.
+    - surface_row=3 → land-ice LMH column of signal_conf_ph
+    - thin_step decimates points for speed
+    - show_all_black toggles the black background (all photons in AOI)
+    """
+    colors = {2:"#ffb703", 3:"#1a78ca", 4:"#2a9d8f"}   # Low, Med, High
+    labels = {2:"Low", 3:"Medium", 4:"High"}
+
+    xs_all, zs_all = [], []
+    xs = {2:[], 3:[], 4:[]}
+    zs = {2:[], 3:[], 4:[]}
+
+    for path in files:
+        with h5py.File(path, "r") as f:
+            if beam not in f: 
+                continue
+            d = read_beam(f, beam)
+            x = along_track(d["seg_x"], d["ph_index_beg"], d["seg_cnt"],
+                            d["dist_ph_along"], d["h"].size)
+
+            conf = d["conf"][:, surface_row] if d["conf"].ndim==2 else d["conf"]
+            lon, lat = np.asarray(d["lon"]), np.asarray(d["lat"])
+            m_aoi = (lon>=bbox[0]) & (lon<=bbox[2]) & (lat>=bbox[1]) & (lat<=bbox[3])
+            mfin  = np.isfinite(x) & np.isfinite(d["h"])
+            m     = m_aoi & mfin
+            if not np.any(m): 
+                continue
+
+            if show_all_black:
+                xs_all.append(x[m]); zs_all.append(d["h"][m])
+
+            for val in (2,3,4):
+                mv = m & (conf==val)
+                if np.any(mv):
+                    xs[val].append(x[mv]); zs[val].append(d["h"][mv])
+
+    # nothing found → bail nicely
+    if not any(len(v) for v in xs.values()) and not xs_all:
+        print(f"No photons in AOI for {beam}.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10,4))
+    if show_all_black and xs_all:
+        X = np.concatenate(xs_all); Z = np.concatenate(zs_all)
+        ax.scatter(X[::thin_step], Z[::thin_step], s=0.2, color="k", alpha=0.25, label="All photons")
+
+    for val in (2,3,4):
+        if xs[val]:
+            X = np.concatenate(xs[val]); Z = np.concatenate(zs[val])
+            ax.scatter(X[::thin_step], Z[::thin_step], s=0.6, color=colors[val], label=labels[val])
+
+    ax.set_title(f"{title_prefix} – {beam}")
+    ax.set_xlabel("Along-track distance (m)")
+    ax.set_ylabel("h_ph (m)")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right", frameon=True)
+    plt.tight_layout()
+    if save:
+        plt.savefig(save, dpi=200)
+    plt.show()
+
+######minimal fix 
+# --- 0) Get ATL03 local files into `files` ---
+import earthaccess as ea
+import os
+
+ea.login()  # will prompt once
+
+# Use your existing config:
+# AOI   = (-68.5, 77.30, -67.5, 77.40)
+# TIME  = ("2019-09-01T00:00:00Z", "2019-09-30T23:59:59Z")
+# OUT   = "./atl03_granules"; os.makedirs(OUT, exist_ok=True)
+
+results = ea.search_data(
+    short_name="ATL03",
+    temporal=TIME,
+    bounding_box=AOI,
+    cloud_hosted=True
+)
+
+downloads = ea.download(results, local_path=OUT)
+files = [str(p) for p in downloads if p and str(p).endswith(".h5")]
+
+if not files:
+    raise SystemExit("No ATL03 .h5 files downloaded for the AOI/TIME.")
+print(f"Found {len(files)} ATL03 granule(s).")
+
+
+# --- how to call it ---
+# one PNG per beam, with and without the black background:
+for b in BEAMS:
+    plot_one_beam(files, b, AOI, show_all_black=False,
+                  title_prefix="LMH only", save=f"{b}_lmh.png")
+    plot_one_beam(files, b, AOI, show_all_black=True,
+                  title_prefix="LMH + all photons", save=f"{b}_lmh_black.png")
+# -------------------- Clean (asymmetric MAD) --------------------
+def mad_filter_asym(x, z, win=50.0, qlo=1.0, qhi=2.0, min_pts=5):
+    x, z = np.asarray(x), np.asarray(z)
+    keep = np.zeros(z.size, bool); half = win/2
+    for i, xi in enumerate(x):
+        m = (x>=xi-half) & (x<=xi+half)
+        if m.sum()<min_pts: continue
+        med = np.median(z[m]); mad = np.median(np.abs(z[m]-med))
+        if mad==0: keep[i]=True; continue
+        lo, hi = med-(qlo/0.6745)*mad, med+(qhi/0.6745)*mad
+        keep[i] = (lo<=z[i]) & (z[i]<=hi)
+    return keep
+
+def build_keep_masks(files):
+    masks = {}
+    for p in files:
+        with h5py.File(p,"r") as f:
+            for b in BEAMS:
+                if b not in f: continue
+                d = read_beam(f,b)
+                x = along_track(d["seg_x"], d["ph_index_beg"], d["seg_cnt"], d["dist_ph_along"], d["h"].size)
+                conf = d["conf"][:,SURFACE_COL] if d["conf"].ndim==2 else d["conf"]
+                lon, lat = d["lon"], d["lat"]
+                base = np.isfinite(x)&np.isfinite(d["h"])&(conf>=2)&(conf<=4)& \
+                       (lon>=AOI[0])&(lon<=AOI[2])&(lat>=AOI[1])&(lat<=AOI[3])
+                k = np.zeros_like(base, bool)
+                if np.any(base): k[base] = mad_filter_asym(x[base], d["h"][base])
+                masks[(p,b)] = k
+    return masks
+
+def gather_kept_one_beam(files, keep_masks, beam="gt3l"):
+    xs, zs, cs = [], [], []
+    for p in files:
+        import h5py
+        with h5py.File(p,"r") as f:
+            print(p, [k for k in f.keys() if k.startswith("gt")])
+            if beam not in f: continue
+            d = read_beam(f,beam)
+            x = along_track(d["seg_x"], d["ph_index_beg"], d["seg_cnt"], d["dist_ph_along"], d["h"].size)
+            conf = d["conf"][:,SURFACE_COL] if d["conf"].ndim==2 else d["conf"]
+            k = keep_masks.get((p,beam))
+            if k is None or not np.any(k): continue
+            xs.append(x[k]); zs.append(d["h"][k]); cs.append(conf[k])
+    return np.concatenate(xs), np.concatenate(zs), np.concatenate(cs)
+
+# -------------------- Variogram + OK --------------------
+def experimental_variogram(x,z,maxlag=150.0,nbins=30,nmax=8000,seed=0):
+    x,z = map(lambda a: np.asarray(a,float), (x,z))
+    m = np.isfinite(x)&np.isfinite(z); x,z = x[m],z[m]
+    if x.size>nmax:
+        rng=np.random.default_rng(seed); idx=rng.choice(x.size,nmax,replace=False); x,z=x[idx],z[idx]
+    i,j = np.triu_indices(x.size,k=1); h=np.abs(x[i]-x[j]); g=0.5*(z[i]-z[j])**2
+    sel=h<=maxlag; h,g=h[sel],g[sel]
+    bins=np.linspace(0,maxlag,nbins+1); ctr=0.5*(bins[:-1]+bins[1:]); gam=np.full(nbins,np.nan); n=np.zeros(nbins,int)
+    which=np.digitize(h,bins)-1
+    for k in range(nbins):
+        m=which==k
+        if np.any(m): gam[k]=np.mean(g[m]); n[k]=m.sum()
+    v=~np.isnan(gam); return ctr[v], gam[v], n[v]
+
+def _cov_gauss(h,sill,R): return sill*np.exp(-0.5*(h/R)**2)
+
+def ok1d(xo,zo,co,xg,R=RANGE,max_k=100,min_pts=3):
+    xo,zo,co,xg = map(np.asarray,(xo,zo,co,xg))
+    o=np.argsort(xo); xo,zo,co = xo[o],zo[o],co[o]
+    sill = max(float(np.var(zo)), 1e-4)
+    def solve(xc,idx):
+        n=idx.size
+        if n<min_pts: return np.nan
+        X, Z = xo[idx], zo[idx]
+        C=_cov_gauss(np.abs(X[:,None]-X[None,:]),sill,R); C.flat[::n+1]+=1e-6
+        A=np.block([[C, np.ones((n,1))],[np.ones((1,n)), np.zeros((1,1))]])
+        rhs=np.r_[_cov_gauss(np.abs(X-xc),sill,R),1.0]
+        try: w=np.linalg.solve(A,rhs)[:n]
+        except np.linalg.LinAlgError: return np.nan
+        return float(w@Z)
+    zhat=np.full(xg.size,np.nan); used=np.zeros(xg.size,int); radii=[3.75,7.5,15.0]
+    def min_count(r): return int(np.ceil((2*r)/0.7))
+    for i,xc in enumerate(xg):
+        z=np.nan
+        for r in radii:
+            within=np.abs(xo-xc)<=r
+            for mask in [(co==4)&within, ((co==4)|(co==3))&within, ((co>=2)&within)]:
+                idx=np.where(mask)[0]
+                if idx.size>= (min(min_pts,min_count(r)) if r<15 else min_pts):
+                    idx = idx[np.argsort(np.abs(xo[idx]-xc))[:max_k]]
+                    z_try=solve(xc,idx)
+                    if np.isfinite(z_try): z=z_try; used[i]=idx.size; break
+            if np.isfinite(z): break
+        zhat[i]=z
+    return zhat, used
+
+# -------------------- High-pass + H --------------------
+def highpass_ma(z, cutoff=HP_LAMBDA):
+    z=np.asarray(z,float); L=max(3,int(round(cutoff))); L+=1-(L%2==1)
+    w=np.isfinite(z).astype(float); z0=np.where(np.isfinite(z),z,0.0)
+    num=np.convolve(z0,np.ones(L),mode="same"); den=np.convolve(w,np.ones(L),mode="same")
+    low=num/np.maximum(den,1e-12); low[den<1]=np.nan
+    return z-low
+
+def obstacle_height(xg,zg,window=H_WINDOW,cutoff=HP_LAMBDA,min_pts=50):
+    zhp=highpass_ma(zg,cutoff); x0,x1=np.nanmin(xg),np.nanmax(xg)
+    edges=np.arange(x0,x1+window,window); idx=np.digitize(xg,edges)-1
+    xc,H=[],[]
+    for k in range(len(edges)-1):
+        sel=idx==k; xc.append(0.5*(edges[k]+edges[k+1]))
+        H.append(np.nan if np.count_nonzero(sel)<min_pts else 2.0*np.nanstd(zhp[sel]))
+    return np.asarray(xc), np.asarray(H), zhp
+
+# -------------------- Run pipeline --------------------
+# 1) search/download
+ea.login()
+res = ea.search_data(short_name="ATL03", temporal=TIME, cloud_hosted=True,
+                     bounding_box=AOI)
+files = [p for p in ea.download(res, local_path=OUT) if p and str(p).endswith(".h5")]
+if not files: raise SystemExit("No ATL03 .h5 files downloaded.")
+
+# 2) clean → kept photons (one beam for kriging, e.g. gt3l)
+keep_masks = build_keep_masks(files)
+x_keep, z_keep, c_keep = gather_kept_one_beam(files, keep_masks, beam="gt3l")
+
+# 3) variogram (diagnostic)
+h_emp, g_emp, n_pairs = experimental_variogram(x_keep, z_keep, maxlag=150, nbins=30, nmax=8000)
+nug = float(np.nanmin(g_emp)); sill = float(max(1e-8, np.nanmax(g_emp)-nug))
+h_line = np.linspace(0, np.nanmax(h_emp), 300)
+g_line = nug + sill*(1.0 - np.exp(-0.5*(h_line/RANGE)**2))
+fig, ax = plt.subplots(figsize=(7,4))
+ax.plot(h_emp,g_emp,"o",ms=4,label="Experimental γ(h)")
+ax.plot(h_line,g_line,"-",lw=2,label=f"Gaussian (R={RANGE:.0f} m)")
+ax.set(xlabel="Lag h (m)", ylabel="Semivariance γ(h)", title="Semivariogram"); ax.grid(alpha=0.3); ax.legend()
+ax2=ax.twinx(); w=(h_emp[-1]-h_emp[0])/max(10,len(h_emp)); ax2.bar(h_emp,n_pairs,width=w,alpha=0.15); ax2.set_ylabel("# pairs")
+plt.tight_layout(); plt.show()
+
+# 4) kriging @ 1 m
+xg = np.arange(np.nanmin(x_keep), np.nanmax(x_keep)+1.0, 1.0)
+zg, used = ok1d(x_keep, z_keep, c_keep, xg, R=RANGE, max_k=100, min_pts=3)
+
+# 5) plots: photons + kriged; residuals + filtered line
+m = np.isfinite(zg)
+plt.figure(figsize=(12,4))
+plt.scatter(x_keep[::3], z_keep[::3], s=2, c="0.85", label="Kept photons")
+plt.plot(xg[m], zg[m], lw=1.8, label=f"Kriged (R={RANGE:.0f} m)")
+plt.xlabel("Along-track (m)"); plt.ylabel("h_ph (m)"); plt.grid(alpha=0.25); plt.legend(); plt.tight_layout(); plt.show()
+
+#xg 1m along-track grid, zg kriged heights
+# 6) high-pass + H
+xc, H, zhp = obstacle_height(xg, zg, window=H_WINDOW, cutoff=HP_LAMBDA)
+fig, axs = plt.subplots(2,1, figsize=(12,5), sharex=True)
+axs[0].plot(xg, zhp, lw=1); axs[0].axhline(0,color="k",lw=0.5,alpha=0.4)
+axs[0].set_title(f"High-pass (Λ={HP_LAMBDA} m)"); axs[0].set_ylabel("z_hp (m)"); axs[0].grid(alpha=0.25)
+axs[1].plot(xc, H, lw=1.5); axs[1].set_title("H = 2·std(high-pass) per 200 m"); axs[1].set(xlabel="Along-track (m)", ylabel="H (m)"); axs[1].grid(alpha=0.25)
+plt.tight_layout(); plt.show()
+# --- Figure-6-style map of obstacle height H (m) for Thule AOI ---
+def map_H_tracks(files, bbox, beams=("gt1l","gt1r","gt2l","gt2r","gt3l","gt3r"),
+                 cutoff_m=35, seg_len=00):
+    xs=[]; ys=[]; Hs=[]
+    for p in files:
+        with h5py.File(p,"r") as f:
+            for b in beams:
+                if b not in f: continue
+                d = read_beam(f,b)
+                x = along_track(d["seg_x"], d["ph_index_beg"], d["seg_cnt"],
+                                d["dist_ph_along"], d["h"].size)
+                conf = d["conf"][:,3] if d["conf"].ndim==2 else d["conf"]  # land-ice column
+                m = np.isfinite(x)&np.isfinite(d["h"])&(conf>=2)&(conf<=4)&\
+                    (d["lon"]>=bbox[0])&(d["lon"]<=bbox[2])&(d["lat"]>=bbox[1])&(d["lat"]<=bbox[3])
+                if m.sum()<50: continue
+                xo,zo,co = x[m], d["h"][m], conf[m]
+                xg = np.arange(np.nanmin(xo), np.nanmax(xo)+1, 1.0)
+                zg,_ = ok1d_paper(xo, zo, co, xg, R=15.0, max_k=100, min_pts=3)  # 1 m profile
+                if np.isfinite(zg).sum()<50: continue
+                zhp = highpass_ma(zg, cutoff_m=cutoff_m)                         # high-pass (~35 m)
+                lon_g = np.interp(xg, xo, d["lon"][m]); lat_g = np.interp(xg, xo, d["lat"][m])
+                edges = np.arange(xg.min(), xg.max()+seg_len, seg_len); idx = np.digitize(xg, edges)-1
+                for k in range(len(edges)-1):
+                    sel = idx==k
+                    if np.count_nonzero(sel)<50: continue
+                    xs.append(np.nanmedian(lon_g[sel])); ys.append(np.nanmedian(lat_g[sel]))
+                    Hs.append(2*np.nanstd(zhp[sel]))  # H = 2*std in 200 m window
+    plt.figure(figsize=(7,6))
+    sc = plt.scatter(xs, ys, c=Hs, s=8, cmap="viridis", vmin=0, vmax=3)
+    plt.colorbar(sc,label="H (m)")
+    plt.xlabel("Longitude"); plt.ylabel("Latitude")
+    plt.title("ICESat-2 obstacle height H – Thule AOI")
+    plt.tight_layout(); plt.show()
+
+# run it
+map_H_tracks(files, bbox)
+#%---------------------------- Extra plot: all vs clean vs kriged ------------------------
+
+# --- plot ---
+fig, ax = plt.subplots(figsize=(10,4))
+ax.scatter(xa[::thin_all], za[::thin_all], s=0.2, c="k", alpha=0.20, label="All ATL03")
+ax.scatter(xk[::thin_keep], zk[::thin_keep], s=1.0, c="#2a9d8f", alpha=0.7, label="Clean ATL03")
+m = np.isfinite(zg); ax.plot(xg[m], zg[m], lw=2, c="#e76f51", label="Height (kriged)")
+ax.set(title=f"{beam} – All vs Cleaned vs Height", xlabel="Along-track (m)", ylabel="h (m)")
+ax.grid(alpha=0.25); ax.legend()
+plt.tight_layout(); plt.show()  # <- this is the only show you need
+
+plot_H_per_beam(files, keep_masks, beams=BEAMS, window_m=200, cutoff_m=35)
+
+
